@@ -44,7 +44,7 @@ def test_blank_reported_line_is_recovered():
     original = beutilogs._readline
     beutilogs._readline = lambda filename, lineno: "" if lineno == 10 else "recovered statement"
     try:
-        source, real, recovered = beutilogs._resolve_source(FakeFrame(), 10)
+        source, real, recovered = beutilogs._locate(FakeFrame(), 10)
     finally:
         beutilogs._readline = original
     assert recovered is True
@@ -86,6 +86,16 @@ def test_missing_source_is_labelled_not_faked():
     except Exception as exc:
         text = beutilogs.capture(exc, color=False)
     assert "source unavailable" in text
+
+
+def test_huge_local_does_not_blow_up_the_report():
+    big = list(range(100_000))
+    try:
+        raise RuntimeError("with a big local")
+    except RuntimeError as exc:
+        text = beutilogs.capture(exc, color=False)
+    assert len(text) < 2000          # repr is bounded, not a 1.5 MB string
+    assert "..." in text
 
 
 def test_watch_reports_and_reraises():

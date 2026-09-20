@@ -21,6 +21,7 @@ import json
 import linecache
 import os
 import re
+import reprlib
 import sys
 import threading
 import traceback
@@ -78,6 +79,17 @@ def _readline(filename: str, lineno: int) -> str:
     return ""
 
 
+def _readlines(filename: str):
+    """Whole-file read, used by the recovery scan (one open instead of N)."""
+    if not filename or filename.startswith("<"):
+        return []
+    try:
+        with open(filename, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        return []
+
+
 def _true_lineno(frame, tb_lineno: int) -> int:
     """Best-effort line from the frame's bytecode.
 
@@ -99,50 +111,67 @@ def _true_lineno(frame, tb_lineno: int) -> int:
 def _locate(frame, tb_lineno):
     """Return ``(source_line, real_lineno, recovered)`` for a traceback frame."""
     lineno = tb_lineno or _true_lineno(frame, tb_lineno)
-    return _resolve_source(frame, lineno)
-
-
-def _resolve_source(frame, lineno: int):
-    """Return ``(source_line, real_lineno, recovered)`` for a frame."""
-    code = frame.f_code
-    line = _readline(code.co_filename, lineno)
+    line = _readline(frame.f_code.co_filename, lineno)
     if line.strip() and not line.lstrip().startswith("#"):
         return line, lineno, False
 
     # The reported line has nothing on it (or is a comment).  Recover the real
-    # statement using the code object's own line table.
-    lines = getattr(code, "co_lines", None)
+    # statement using the code object's own line table.  Read the file once:
+    # candidates can be numerous and re-opening per candidate is quadratic.
+    source_lines = _readlines(frame.f_code.co_filename)
+    lines = getattr(frame.f_code, "co_lines", None)
     candidates = sorted({ln for _, _, ln in lines() if ln}) if lines else []
     for cand in sorted(candidates, key=lambda ln: abs(ln - lineno)):
-        text = _readline(code.co_filename, cand)
+        text = _readline(frame.f_code.co_filename, cand)
+        if not text and 0 < cand <= len(source_lines):
+            text = source_lines[cand - 1]
         if text.strip() and not text.lstrip().startswith("#"):
             return text, cand, True
     return "", lineno, False
 
 
 def _culprit(exc: BaseException):
-    """Pick the frame that actually failed, ignoring beutilogs itself."""
+    """Pick the frame that actually failed, ignoring beutilogs itself.
+
+    Returns ``(frame, lineno, frame_count)``.
+    """
     tb = exc.__traceback__
     if tb is None:
-        return None, None
+        return None, None, 0
     frames = list(traceback.walk_tb(tb))
     if not frames:
-        return None, None
+        return None, None, 0
 
     def internal(frame) -> bool:
-        path = os.path.abspath(frame.f_code.co_filename)
-        return path.startswith(_PKG_DIR) or frame.f_code.co_filename.startswith("<frozen")
+        filename = frame.f_code.co_filename
+        return filename.startswith("<frozen") or os.path.abspath(filename).startswith(_PKG_DIR)
 
     user_frames = [item for item in frames if not internal(item[0])]
     frame, lineno = (user_frames or frames)[-1]
-    return frame, lineno
+    return frame, lineno, len(frames)
+
+
+_REPR_LIMIT = 64
+
+
+def _safe_repr(value) -> str:
+    """``repr`` bounded for big containers.
+
+    A million-element list should cost microseconds, not build a megabyte
+    string only to be truncated to 240 characters.
+    """
+    try:
+        huge = len(value) > _REPR_LIMIT
+    except TypeError:
+        huge = False
+    return reprlib.repr(value) if huge else repr(value)
 
 
 def _locals(frame, limit: int = 12, maxlen: int = 240):
     out = []
     for name, value in frame.f_locals.items():
         try:
-            rep = repr(value)
+            rep = _safe_repr(value)
         except Exception:
             rep = "<unrepr-able>"
         if len(rep) > maxlen:
@@ -217,13 +246,14 @@ def capture(exc: BaseException | None = None, *, include_locals: bool = True,
     etype = type(exc).__name__
     message = str(exc)
 
-    frame, tb_lineno = _culprit(exc)
+    frame, tb_lineno, frame_count = _culprit(exc)
     header = [f"{c['bold']}{c['red']}{etype}{c['reset']}"]
     if message:
         header.append(message)
 
     lines = list(header)
     recovered_from = None
+    real = None
     if frame is not None:
         reported = tb_lineno or _true_lineno(frame, tb_lineno)
         source, real, recovered = _locate(frame, tb_lineno)
@@ -256,10 +286,17 @@ def capture(exc: BaseException | None = None, *, include_locals: bool = True,
                 lines_out.append(f"{c['dim']}locals:{c['reset']}")
                 lines_out.extend(f"  {c['dim']}{l}{c['reset']}" for l in shown)
 
-    # Full chain / groups, rendered by the standard library.
-    body = "".join(traceback.TracebackException.from_exception(exc).format())
-    lines_out.append(f"{c['dim']}traceback (full chain):{c['reset']}")
-    lines_out.append(body.rstrip("\n"))
+    # Rendering the chain is the single most expensive thing here, and for a
+    # lone exception with one frame it would only repeat the block above.
+    has_chain = (
+        exc.__cause__ is not None
+        or (exc.__context__ is not None and not exc.__suppress_context__)
+        or isinstance(exc, BaseExceptionGroup)
+    )
+    if frame_count > 1 or has_chain:
+        body = "".join(traceback.TracebackException.from_exception(exc).format())
+        lines_out.append(f"{c['dim']}traceback (full chain):{c['reset']}")
+        lines_out.append(body.rstrip("\n"))
     return "\n".join(lines_out)
 
 
@@ -295,7 +332,7 @@ def log(exc: BaseException | None = None, path: str = "beutilogs.jsonl",
     if exc is None:
         raise RuntimeError("beutilogs.log() called with no active exception")
 
-    frame, tb_lineno = _culprit(exc)
+    frame, tb_lineno, _ = _culprit(exc)
     record = {
         "time": datetime.now(timezone.utc).isoformat(),
         "type": type(exc).__name__,
@@ -317,7 +354,7 @@ def log(exc: BaseException | None = None, path: str = "beutilogs.jsonl",
         if include_locals:
             for name, value in list(frame.f_locals.items())[:12]:
                 try:
-                    record["locals"][name] = repr(value)[:240]
+                    record["locals"][name] = _safe_repr(value)[:240]
                 except Exception:
                     record["locals"][name] = "<unrepr-able>"
 
