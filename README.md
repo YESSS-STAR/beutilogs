@@ -73,8 +73,8 @@ One glance: **what** failed, **where** (the real line, with a caret), **why**
 
 | Default traceback | beutilogs |
 | --- | --- |
-| Trusts `tb_lineno` and `linecache` | Recomputes the line from the frame's own bytecode (`code.co_lines()` + `f_lasti`), so a stale cache cannot mislead it |
-| Prints an empty line if the source moved | Re-reads the source from disk, bypassing `linecache`, and recovers the real statement from the code object — flagging it as recovered |
+| Trusts `linecache`, which can be stale | Reads the source from disk fresh; the traceback's own line number stays authoritative, so a caught-and-re-logged error blames the `raise` line, not the `except` line |
+| Prints an empty line if the source moved | Recovers the real statement from the code object's line table and flags it as recovered |
 | Shows a blurry wall of frames | Names one **culprit** frame (`bug here ->`), skipping library/`<frozen>` internals |
 | Leaves you to scroll and `print()` | Shows the culprit's **locals** inline |
 | Drops chain context in custom handlers | Keeps `raise ... from ...`, `__context__`, and `ExceptionGroup`s intact |
@@ -118,7 +118,11 @@ def charge_card(order):
     ...
 ```
 
-Reports the error, then re-raises it unchanged.
+Reports the error, then re-raises it unchanged. Works on `async def` too.
+
+**Full integration guide** — logging module, Flask/FastAPI/Django, async loops,
+JSON lines, rotation, production checklist: [`docs/integration.md`](docs/integration.md)
+(and a runnable [`examples/integration.py`](examples/integration.py)).
 
 ---
 
@@ -165,9 +169,12 @@ No framework required:
 $ python tests/test_beutilogs.py
 ok  test_blank_reported_line_is_recovered
 ok  test_capture_names_the_real_line
+ok  test_live_frame_reports_raise_site_not_except_site
 ok  test_log_writes_jsonl
 ok  test_missing_source_is_labelled_not_faked
-4 passed
+ok  test_watch_reports_and_reraises
+ok  test_watch_supports_async_functions
+7 passed
 ```
 
 ## License

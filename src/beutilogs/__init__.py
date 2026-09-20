@@ -79,7 +79,13 @@ def _readline(filename: str, lineno: int) -> str:
 
 
 def _true_lineno(frame, tb_lineno: int) -> int:
-    """Recompute the executing line from the bytecode, immune to stale linecache."""
+    """Best-effort line from the frame's bytecode.
+
+    Only used when the traceback has no usable line number: a frame that is
+    still live (an exception caught and re-logged) has ``f_lasti`` pointing at
+    whatever it is executing *now*, not at the raise site, so ``tb_lineno`` wins
+    whenever it exists.
+    """
     code = frame.f_code
     lasti = getattr(frame, "f_lasti", -1)
     lines = getattr(code, "co_lines", None)
@@ -88,6 +94,12 @@ def _true_lineno(frame, tb_lineno: int) -> int:
             if lineno and start <= lasti < end:
                 return lineno
     return tb_lineno
+
+
+def _locate(frame, tb_lineno):
+    """Return ``(source_line, real_lineno, recovered)`` for a traceback frame."""
+    lineno = tb_lineno or _true_lineno(frame, tb_lineno)
+    return _resolve_source(frame, lineno)
 
 
 def _resolve_source(frame, lineno: int):
@@ -213,10 +225,10 @@ def capture(exc: BaseException | None = None, *, include_locals: bool = True,
     lines = list(header)
     recovered_from = None
     if frame is not None:
-        true = _true_lineno(frame, tb_lineno)
-        source, real, recovered = _resolve_source(frame, true)
-        if recovered and real != true:
-            recovered_from = true
+        reported = tb_lineno or _true_lineno(frame, tb_lineno)
+        source, real, recovered = _locate(frame, tb_lineno)
+        if recovered and real != reported:
+            recovered_from = reported
         path = frame.f_code.co_filename
         rel = os.path.relpath(path) if os.path.isabs(path) else path
         where = f"{c['yellow']}{rel}:{real}{c['reset']} in {frame.f_code.co_name}()"
@@ -293,15 +305,15 @@ def log(exc: BaseException | None = None, path: str = "beutilogs.jsonl",
         "locals": {},
     }
     if frame is not None:
-        true = _true_lineno(frame, tb_lineno)
-        source, real, recovered = _resolve_source(frame, true)
+        reported = tb_lineno or _true_lineno(frame, tb_lineno)
+        source, real, recovered = _locate(frame, tb_lineno)
         record["where"] = {
             "file": frame.f_code.co_filename,
             "line": real,
             "function": frame.f_code.co_name,
             "source": source,
         }
-        record["recovered_line"] = true if recovered and real != true else None
+        record["recovered_line"] = reported if recovered and real != reported else None
         if include_locals:
             for name, value in list(frame.f_locals.items())[:12]:
                 try:
@@ -354,8 +366,24 @@ def install(*, stream=None, path: str | None = None, include_locals: bool = True
 
 
 def watch(func):
-    """Decorator: report the error, then re-raise it unchanged."""
+    """Decorator: report the error, then re-raise it unchanged.
+
+    Works on sync and ``async def`` functions.
+    """
     import functools
+    import inspect
+
+    if inspect.iscoroutinefunction(func):
+
+        @functools.wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - reporting is the point
+                report(exc)
+                raise
+
+        return async_wrapper
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
